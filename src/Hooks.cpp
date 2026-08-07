@@ -6,6 +6,44 @@ namespace
 {
     thread_local bool g_handlingEmergency = false;
 
+    void SendEmergencyEvent(RE::PlayerCharacter* a_player, const char* a_eventName)
+    {
+        if (!a_player || !a_eventName || a_eventName[0] == '\0') {
+            return;
+        }
+
+        const bool sent = a_player->NotifyAnimationGraph(a_eventName);
+        logger::debug("[EmergencyHeal][Event] NotifyAnimationGraph '{}' retornou {}.", a_eventName, sent);
+    }
+
+    float ResolveHealthThreshold(RE::PlayerCharacter* a_player)
+    {
+        const auto& config = EmergencyHeal::Settings::Get();
+        float threshold = EmergencyHeal::Settings::ResolveValue(a_player, config.healthThreshold);
+        if (config.thresholdMode == EmergencyHeal::Settings::ThresholdMode::kPercent) {
+            const float maxHealth = std::max(
+                1.0F, a_player->GetActorValueMax(RE::ActorValue::kHealth));
+            return maxHealth * std::clamp(threshold, 0.0F, 100.0F) / 100.0F;
+        }
+        return std::max(0.0F, threshold);
+    }
+
+    bool CanUseFatalProtection(
+        RE::PlayerCharacter* a_player, float a_projectedHealth, float a_threshold)
+    {
+        if (!a_player || a_projectedHealth > 0.0F) {
+            return false;
+        }
+
+        const auto& config = EmergencyHeal::Settings::Get();
+        const bool zeroThreshold = a_threshold <= 0.001F;
+        const bool fatalProtectionEnabled =
+            config.protectFatalDamageAtAnyThreshold ||
+            (zeroThreshold && config.protectFatalDamageAtZeroThreshold);
+        return fatalProtectionEnabled &&
+               EmergencyHeal::Settings::HasRequiredPerk(a_player, config.fatalProtectionPerk);
+    }
+
     float GetPositiveHealthMagnitude(const RE::MagicItem* a_item)
     {
         if (!a_item || a_item->IsHostile()) {
@@ -109,6 +147,7 @@ namespace
             if (consumed) {
                 logger::info("Emergency Heal consumiu a pocao {:08X} (forca {}).",
                     candidate.potion->GetFormID(), candidate.score);
+                SendEmergencyEvent(a_player, "EmergencyPotion");
                 return true;
             }
         }
@@ -207,8 +246,57 @@ namespace
             spell->GetFormID(), cast, magicka, cost, forceCast);
         if (cast) {
             logger::info("Emergency Heal castou a magia de cura {:08X}, custo {}.", spell->GetFormID(), cost);
+            SendEmergencyEvent(a_player, "EmergencyHeal");
         }
         return cast;
+    }
+
+    bool ApplyGodMercy(RE::PlayerCharacter* a_player)
+    {
+        const auto& config = EmergencyHeal::Settings::Get();
+        if (!config.godMercyEnabled ||
+            !EmergencyHeal::Settings::HasRequiredPerk(a_player, config.godMercyPerk)) {
+            logger::debug(
+                "[EmergencyHeal][UndeservedMercy] Bloqueado: enabled={}, perk={:08X}, possuiPerk={}.",
+                config.godMercyEnabled,
+                config.godMercyPerk,
+                EmergencyHeal::Settings::HasRequiredPerk(a_player, config.godMercyPerk));
+            return false;
+        }
+
+        auto* owner = a_player ? a_player->AsActorValueOwner() : nullptr;
+        if (!owner) {
+            logger::debug("[EmergencyHeal][UndeservedMercy] Bloqueado: ActorValueOwner indisponivel.");
+            return false;
+        }
+
+        const float maxHealth = std::max(1.0F, a_player->GetActorValueMax(RE::ActorValue::kHealth));
+        const float configuredValue =
+            EmergencyHeal::Settings::ResolveValue(a_player, config.godMercyHealAmount);
+        const float healAmount =
+            config.godMercyHealMode == EmergencyHeal::Settings::ThresholdMode::kPercent ?
+            maxHealth * std::clamp(configuredValue, 0.0F, 100.0F) / 100.0F :
+            std::max(0.0F, configuredValue);
+
+        if (healAmount <= 0.0F) {
+            logger::debug(
+                "[EmergencyHeal][UndeservedMercy] Bloqueado: valor resolvido={}, modo={}, cura final={}.",
+                configuredValue,
+                static_cast<int>(config.godMercyHealMode),
+                healAmount);
+            return false;
+        }
+
+        const float healthBefore = owner->GetActorValue(RE::ActorValue::kHealth);
+        owner->RestoreActorValue(RE::ActorValue::kHealth, healAmount);
+        const float healthAfter = owner->GetActorValue(RE::ActorValue::kHealth);
+        SendEmergencyEvent(a_player, "EmergancyMercy");
+        logger::info(
+            "Emergency Heal aplicou Undeserved Mercy: cura={}, vida antes={}, vida depois={}.",
+            healAmount,
+            healthBefore,
+            healthAfter);
+        return true;
     }
 
     void CastAdditionalSpells(RE::PlayerCharacter* a_player)
@@ -240,14 +328,115 @@ namespace
     void PerformEmergencyAction(RE::PlayerCharacter* a_player)
     {
         logger::debug("[EmergencyHeal] Executando acao de emergencia.");
-        const bool usedItem = ConsumeBestHealingItem(a_player);
+        bool usedItem = false;
+        bool castMagic = false;
+        bool usedFavor = false;
+
+        if (EmergencyHeal::Usage::CanUseChannel(
+                a_player, EmergencyHeal::Usage::Channel::kPotion)) {
+            usedItem = ConsumeBestHealingItem(a_player);
+            if (usedItem) {
+                EmergencyHeal::Usage::RecordChannelUse(
+                    EmergencyHeal::Usage::Channel::kPotion);
+            }
+        } else {
+            logger::debug("[EmergencyHeal] Pocao ignorada: cota propria ou cooldown indisponivel.");
+        }
+
         if (!usedItem) {
-            const bool castMagic = CastEmergencyHealingSpell(a_player);
+            if (EmergencyHeal::Usage::CanUseChannel(
+                    a_player, EmergencyHeal::Usage::Channel::kMagic)) {
+                castMagic = CastEmergencyHealingSpell(a_player);
+                if (castMagic) {
+                    EmergencyHeal::Usage::RecordChannelUse(
+                        EmergencyHeal::Usage::Channel::kMagic);
+                }
+            } else {
+                logger::debug("[EmergencyHeal] Magia ignorada: cota propria ou cooldown indisponivel.");
+            }
             logger::debug("[EmergencyHeal] Nenhum item consumido; resultado do fallback magico={}", castMagic);
+            if (!castMagic) {
+                if (EmergencyHeal::Usage::CanUseChannel(
+                        a_player, EmergencyHeal::Usage::Channel::kGodMercy)) {
+                    usedFavor = ApplyGodMercy(a_player);
+                    if (usedFavor) {
+                        EmergencyHeal::Usage::RecordChannelUse(
+                            EmergencyHeal::Usage::Channel::kGodMercy);
+                    }
+                } else {
+                    logger::debug(
+                        "[EmergencyHeal] Undeserved Mercy ignorado: cota propria ou cooldown indisponivel.");
+                }
+                logger::debug(
+                    "[EmergencyHeal] Pocao e magia falharam; resultado de Undeserved Mercy={}",
+                    usedFavor);
+            }
         }
         CastAdditionalSpells(a_player);
-        logger::debug("[EmergencyHeal] Acao de emergencia concluida.");
+        logger::debug(
+            "[EmergencyHeal] Acao concluida: potion={}, magic={}, favor={}.",
+            usedItem,
+            castMagic,
+            usedFavor);
     }
+
+    struct ProcessHitHook
+    {
+        static void thunk(RE::Actor* a_victim, RE::HitData& a_hitData)
+        {
+            if (!g_handlingEmergency && a_victim && a_victim->IsPlayerRef()) {
+                auto* player = static_cast<RE::PlayerCharacter*>(a_victim);
+                const auto& config = EmergencyHeal::Settings::Get();
+                auto* owner = player->AsActorValueOwner();
+                const float damage = std::abs(a_hitData.totalDamage);
+                const float health = owner ?
+                    owner->GetActorValue(RE::ActorValue::kHealth) : 0.0F;
+                const float projectedHealth = health - damage;
+                const float threshold = ResolveHealthThreshold(player);
+                const bool hitMarkedFatal =
+                    a_hitData.flags.all(RE::HitData::Flag::kFatal) ||
+                    a_hitData.flags.all(RE::HitData::Flag::kCriticalOnDeath);
+                const float fatalProjectedHealth =
+                    hitMarkedFatal ? std::min(projectedHealth, 0.0F) : projectedHealth;
+                const bool systemAvailable =
+                    config.enabled &&
+                    owner &&
+                    EmergencyHeal::Settings::HasRequiredPerk(player, config.requiredPerk) &&
+                    !EmergencyHeal::Settings::IsDisabledByPerk(player, config.disablingPerk);
+                const bool fatalProtectionAvailable =
+                    systemAvailable &&
+                    config.preventFatalKillmoves &&
+                    CanUseFatalProtection(player, fatalProjectedHealth, threshold) &&
+                    EmergencyHeal::Usage::CanConsumeActivation(player);
+
+                if (fatalProtectionAvailable) {
+                    const bool hadFatalFlag =
+                        a_hitData.flags.all(RE::HitData::Flag::kFatal);
+                    const bool hadCriticalOnDeathFlag =
+                        a_hitData.flags.all(RE::HitData::Flag::kCriticalOnDeath);
+                    a_hitData.flags.reset(RE::HitData::Flag::kFatal);
+                    a_hitData.flags.reset(RE::HitData::Flag::kCriticalOnDeath);
+
+                    auto* attacker = a_hitData.aggressor.get().get();
+                    logger::debug(
+                        "[EmergencyHeal][KillMove][PreHit] Fatalidade removida: "
+                        "damage={}, health={}, projected={}, threshold={}, fatalFlag={}, "
+                        "criticalOnDeathFlag={}, attacker={:08X}.",
+                        damage,
+                        health,
+                        projectedHealth,
+                        threshold,
+                        hadFatalFlag,
+                        hadCriticalOnDeathFlag,
+                        attacker ? attacker->GetFormID() : 0);
+                }
+            }
+
+            func(a_victim, a_hitData);
+        }
+
+        static inline REL::Relocation<decltype(thunk)> func;
+    };
 
     struct HandleHealthDamageHook
     {
@@ -289,12 +478,7 @@ namespace
             const float maxHealth = std::max(1.0F, player->GetActorValueMax(RE::ActorValue::kHealth));
             const float damageMagnitude = std::abs(a_damage);
             const float projectedHealth = health - damageMagnitude;
-            float threshold = EmergencyHeal::Settings::ResolveValue(player, config.healthThreshold);
-            if (config.thresholdMode == EmergencyHeal::Settings::ThresholdMode::kPercent) {
-                threshold = maxHealth * std::clamp(threshold, 0.0F, 100.0F) / 100.0F;
-            } else {
-                threshold = std::max(0.0F, threshold);
-            }
+            const float threshold = ResolveHealthThreshold(player);
 
             logger::debug(
                 "[EmergencyHeal][Damage] Avaliacao: health={}, maxHealth={}, rawDamage={}, magnitude={}, projected={}, threshold={}, mode={}, source={}.",
@@ -315,7 +499,7 @@ namespace
             }
 
             if (!EmergencyHeal::Usage::TryConsumeActivation(player)) {
-                logger::debug("[EmergencyHeal][Damage] Nao ativou: cota da janela indisponivel.");
+                logger::debug("[EmergencyHeal][Damage] Nao ativou: cota geral indisponivel.");
                 func(a_actor, a_attacker, a_damage);
                 return;
             }
@@ -323,10 +507,10 @@ namespace
             logger::debug("[EmergencyHeal][Damage] GATILHO ATIVADO: projected={} <= threshold={}.",
                 projectedHealth, threshold);
 
-            const bool zeroThreshold = threshold <= 0.001F;
             const bool fatal = projectedHealth <= 0.0F;
-            const bool protectFatal = fatal && zeroThreshold && config.protectFatalDamageAtZeroThreshold &&
-                EmergencyHeal::Settings::HasRequiredPerk(player, config.fatalProtectionPerk);
+            const bool zeroThreshold = threshold <= 0.001F;
+            const bool protectFatal =
+                CanUseFatalProtection(player, projectedHealth, threshold);
 
             g_handlingEmergency = true;
             if (protectFatal) {
@@ -343,10 +527,12 @@ namespace
                 logger::info("Emergency Heal bloqueou dano fatal e preservou 1 de vida.");
             } else {
                 logger::debug(
-                    "[EmergencyHeal][Damage] Aplicando dano original; fatal={}, zeroThreshold={}, fatalEnabled={}, possuiPerk={}.",
+                    "[EmergencyHeal][Damage] Aplicando dano original; fatal={}, zeroThreshold={}, "
+                    "fatalAtZeroEnabled={}, fatalAtAnyThresholdEnabled={}, possuiPerk={}.",
                     fatal,
                     zeroThreshold,
                     config.protectFatalDamageAtZeroThreshold,
+                    config.protectFatalDamageAtAnyThreshold,
                     EmergencyHeal::Settings::HasRequiredPerk(player, config.fatalProtectionPerk));
                 func(a_actor, a_attacker, a_damage);
             }
@@ -368,6 +554,14 @@ namespace EmergencyHeal::Hooks
             return;
         }
         installed = true;
+
+        SKSE::AllocTrampoline(14);
+        auto& trampoline = SKSE::GetTrampoline();
+        REL::Relocation<std::uintptr_t> meleeHit{ RELOCATION_ID(37673, 38627) };
+        ProcessHitHook::func = trampoline.write_call<5>(
+            meleeHit.address() + REL::Relocate(0x3C0, 0x4A8),
+            ProcessHitHook::thunk);
+        logger::info("Emergency Heal: hook de ProcessHit instalado para prevenir killmoves fatais.");
 
         REL::Relocation<std::uintptr_t> vtable{ RE::VTABLE_PlayerCharacter[0] };
         HandleHealthDamageHook::func = vtable.write_vfunc(

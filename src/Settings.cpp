@@ -85,6 +85,36 @@ namespace
         ReadForm(a_object, "global", a_value.global);
     }
 
+    rapidjson::Value SerializeCooldown(
+        const EmergencyHeal::Settings::Cooldown& a_cooldown,
+        rapidjson::Document::AllocatorType& a_alloc)
+    {
+        rapidjson::Value object(rapidjson::kObjectType);
+        object.AddMember("duration", SerializeSourcedValue(a_cooldown.duration, a_alloc), a_alloc);
+        object.AddMember("unit", static_cast<int>(a_cooldown.unit), a_alloc);
+        object.AddMember("clock", static_cast<int>(a_cooldown.clock), a_alloc);
+        return object;
+    }
+
+    void DeserializeCooldown(const rapidjson::Value& a_object,
+        EmergencyHeal::Settings::Cooldown& a_cooldown)
+    {
+        if (!a_object.IsObject()) {
+            return;
+        }
+        if (a_object.HasMember("duration")) {
+            DeserializeSourcedValue(a_object["duration"], a_cooldown.duration);
+        }
+        if (a_object.HasMember("unit") && a_object["unit"].IsInt()) {
+            a_cooldown.unit = static_cast<EmergencyHeal::Settings::CooldownUnit>(
+                std::clamp(a_object["unit"].GetInt(), 0, 2));
+        }
+        if (a_object.HasMember("clock") && a_object["clock"].IsInt()) {
+            a_cooldown.clock = static_cast<EmergencyHeal::Settings::CooldownClock>(
+                std::clamp(a_object["clock"].GetInt(), 0, 1));
+        }
+    }
+
     bool DrawDropdown(const char* a_label, const std::string& a_category,
         RE::FormID& a_currentFormID, float a_width = 340.0F)
     {
@@ -270,6 +300,44 @@ namespace
         return changed;
     }
 
+    bool RenderCooldown(const char* a_id, EmergencyHeal::Settings::Cooldown& a_cooldown)
+    {
+        bool changed = false;
+        ImGui::PushID(a_id);
+
+        const char* clocks[] = {
+            EmergencyHealMenu::GetLoc("menu.cooldown_real_time", "Real time"),
+            EmergencyHealMenu::GetLoc("menu.cooldown_game_time", "Game time")
+        };
+        int clock = static_cast<int>(a_cooldown.clock);
+        if (ImGui::Combo(EmergencyHealMenu::GetLoc("menu.cooldown_clock", "Cooldown clock"),
+                &clock, clocks, 2)) {
+            a_cooldown.clock = static_cast<EmergencyHeal::Settings::CooldownClock>(clock);
+            changed = true;
+        }
+
+        const char* units[] = {
+            EmergencyHealMenu::GetLoc("menu.cooldown_seconds", "Seconds"),
+            EmergencyHealMenu::GetLoc("menu.cooldown_minutes", "Minutes"),
+            EmergencyHealMenu::GetLoc("menu.cooldown_hours", "Hours")
+        };
+        int unit = static_cast<int>(a_cooldown.unit);
+        if (ImGui::Combo(EmergencyHealMenu::GetLoc("menu.cooldown_unit", "Cooldown unit"),
+                &unit, units, 3)) {
+            a_cooldown.unit = static_cast<EmergencyHeal::Settings::CooldownUnit>(unit);
+            changed = true;
+        }
+
+        changed |= RenderSourcedValue("duration",
+            EmergencyHealMenu::GetLoc("menu.cooldown_duration", "Cooldown duration"),
+            a_cooldown.duration, 0.0F, 1000000.0F);
+        ImGui::TextWrapped("%s", EmergencyHealMenu::GetLoc("menu.cooldown_zero_hint",
+            "A duration of 0 disables this cooldown."));
+
+        ImGui::PopID();
+        return changed;
+    }
+
     void GameplayRender()
     {
         auto& config = EmergencyHeal::Settings::Get();
@@ -297,19 +365,28 @@ namespace
             changed |= RenderSourcedValue("health_threshold",
                 EmergencyHealMenu::GetLoc("menu.health_threshold", "Trigger at or below"),
                 config.healthThreshold, 0.0F, maximum);
-            ImGui::Unindent();
-        }
 
-        if (ImGui::CollapsingHeader(EmergencyHealMenu::GetLoc("menu.frequency_header", "Usage frequency"))) {
-            ImGui::Indent();
+            ImGui::Separator();
             changed |= RenderSourcedValue("usage_period",
                 EmergencyHealMenu::GetLoc("menu.usage_period", "Usage window (game days)"),
                 config.usagePeriodDays, 1.0F, 365.0F);
             changed |= RenderSourcedValue("uses_per_day",
-                EmergencyHealMenu::GetLoc("menu.activations_per_day", "Activations per game day"),
+                EmergencyHealMenu::GetLoc("menu.activations_per_day",
+                    "Health trigger activations per game day"),
                 config.activationsPerDay, 0.0F, 1000.0F, true);
-            ImGui::TextWrapped("%s", EmergencyHealMenu::GetLoc("menu.frequency_hint",
-                "The limit for each window is activations per day multiplied by the window length."));
+            ImGui::TextWrapped("%s", EmergencyHealMenu::GetLoc("menu.health_frequency_hint",
+                "The total trigger limit is activations per day multiplied by the usage window."));
+            ImGui::Unindent();
+        }
+
+        if (ImGui::CollapsingHeader(EmergencyHealMenu::GetLoc(
+                "menu.potion_header", "Emergency healing potion"))) {
+            ImGui::Indent();
+            changed |= RenderSourcedValue("potion_uses_per_day",
+                EmergencyHealMenu::GetLoc("menu.potion_activations_per_day",
+                    "Potion activations per game day"),
+                config.potionActivationsPerDay, 0.0F, 1000.0F, true);
+            changed |= RenderCooldown("potion_cooldown", config.potionCooldown);
             ImGui::Unindent();
         }
 
@@ -318,7 +395,14 @@ namespace
             changed |= ImGui::Checkbox(EmergencyHealMenu::GetLoc("menu.protect_fatal",
                 "At a 0/0% threshold, leave the player at 1 health"),
                 &config.protectFatalDamageAtZeroThreshold);
-            if (config.protectFatalDamageAtZeroThreshold) {
+            changed |= ImGui::Checkbox(EmergencyHealMenu::GetLoc("menu.protect_fatal_any_threshold",
+                "Protect fatal damage at any threshold"),
+                &config.protectFatalDamageAtAnyThreshold);
+            if (config.protectFatalDamageAtZeroThreshold || config.protectFatalDamageAtAnyThreshold) {
+                changed |= ImGui::Checkbox(EmergencyHealMenu::GetLoc(
+                    "menu.prevent_fatal_killmoves",
+                    "Prevent fatal killmoves before they start"),
+                    &config.preventFatalKillmoves);
                 changed |= DrawDropdown(EmergencyHealMenu::GetLoc("menu.fatal_perk", "Lock fatal protection behind a perk"),
                     "Perk", config.fatalProtectionPerk);
             }
@@ -338,6 +422,50 @@ namespace
                     changed |= DrawDropdown(EmergencyHealMenu::GetLoc("menu.no_mana_perk", "Lock no-mana casting behind a perk"),
                         "Perk", config.noManaCastPerk);
                 }
+                ImGui::Separator();
+                changed |= RenderSourcedValue("magic_uses_per_day",
+                    EmergencyHealMenu::GetLoc("menu.magic_activations_per_day",
+                        "Magic activations per game day"),
+                    config.magicActivationsPerDay, 0.0F, 1000.0F, true);
+                changed |= RenderCooldown("magic_cooldown", config.magicCooldown);
+            }
+            ImGui::Unindent();
+        }
+
+        if (ImGui::CollapsingHeader(EmergencyHealMenu::GetLoc(
+                "menu.undeserved_mercy_header", "Undeserved Mercy"))) {
+            ImGui::Indent();
+            changed |= ImGui::Checkbox(EmergencyHealMenu::GetLoc("menu.undeserved_mercy_enabled",
+                "Use Undeserved Mercy when no potion or healing magic can be used"), &config.godMercyEnabled);
+            if (config.godMercyEnabled) {
+                changed |= DrawDropdown(EmergencyHealMenu::GetLoc("menu.undeserved_mercy_perk",
+                    "Lock Undeserved Mercy behind a perk"), "Perk", config.godMercyPerk);
+
+                const char* healModes[] = {
+                    EmergencyHealMenu::GetLoc("menu.heal_flat", "Flat health"),
+                    EmergencyHealMenu::GetLoc("menu.heal_percent", "Percentage of maximum health")
+                };
+                int healMode = static_cast<int>(config.godMercyHealMode);
+                if (ImGui::Combo(EmergencyHealMenu::GetLoc("menu.undeserved_mercy_heal_mode",
+                    "Undeserved Mercy healing mode"), &healMode, healModes, 2)) {
+                    config.godMercyHealMode =
+                        static_cast<EmergencyHeal::Settings::ThresholdMode>(healMode);
+                    changed = true;
+                }
+
+                const float maximum =
+                    config.godMercyHealMode == EmergencyHeal::Settings::ThresholdMode::kPercent ?
+                    100.0F : 10000.0F;
+                changed |= RenderSourcedValue("god_mercy_heal",
+                    EmergencyHealMenu::GetLoc(
+                        "menu.undeserved_mercy_heal_amount", "Undeserved Mercy healing amount"),
+                    config.godMercyHealAmount, 0.0F, maximum);
+                ImGui::Separator();
+                changed |= RenderSourcedValue("favor_uses_per_day",
+                    EmergencyHealMenu::GetLoc("menu.undeserved_mercy_activations_per_day",
+                        "Undeserved Mercy activations per game day"),
+                    config.godMercyActivationsPerDay, 0.0F, 1000.0F, true);
+                changed |= RenderCooldown("undeserved_mercy_cooldown", config.godMercyCooldown);
             }
             ImGui::Unindent();
         }
@@ -520,10 +648,47 @@ namespace EmergencyHealMenu
         }
         if (document.HasMember("usagePeriodDays")) DeserializeSourcedValue(document["usagePeriodDays"], config.usagePeriodDays);
         if (document.HasMember("activationsPerDay")) DeserializeSourcedValue(document["activationsPerDay"], config.activationsPerDay);
+        if (document.HasMember("potionActivationsPerDay")) {
+            DeserializeSourcedValue(document["potionActivationsPerDay"], config.potionActivationsPerDay);
+        }
+        if (document.HasMember("magicActivationsPerDay")) {
+            DeserializeSourcedValue(document["magicActivationsPerDay"], config.magicActivationsPerDay);
+        }
+        if (document.HasMember("godMercyActivationsPerDay")) {
+            DeserializeSourcedValue(document["godMercyActivationsPerDay"], config.godMercyActivationsPerDay);
+        }
+        const bool hasChannelCooldowns =
+            document.HasMember("potionCooldown") ||
+            document.HasMember("magicCooldown") ||
+            document.HasMember("godMercyCooldown");
+        if (document.HasMember("potionCooldown")) {
+            DeserializeCooldown(document["potionCooldown"], config.potionCooldown);
+        }
+        if (document.HasMember("magicCooldown")) {
+            DeserializeCooldown(document["magicCooldown"], config.magicCooldown);
+        }
+        if (document.HasMember("godMercyCooldown")) {
+            DeserializeCooldown(document["godMercyCooldown"], config.godMercyCooldown);
+        }
+        if (!hasChannelCooldowns && document.HasMember("triggerCooldownSeconds")) {
+            EmergencyHeal::Settings::SourcedValue legacyCooldown;
+            DeserializeSourcedValue(document["triggerCooldownSeconds"], legacyCooldown);
+            config.potionCooldown.duration = legacyCooldown;
+            config.magicCooldown.duration = legacyCooldown;
+            config.godMercyCooldown.duration = legacyCooldown;
+            logger::info(
+                "Emergency Heal: cooldown geral anterior aplicado aos tres canais.");
+        }
         ReadForm(document, "requiredPerk", config.requiredPerk);
         ReadForm(document, "disablingPerk", config.disablingPerk);
         if (document.HasMember("protectFatalDamageAtZeroThreshold") && document["protectFatalDamageAtZeroThreshold"].IsBool()) {
             config.protectFatalDamageAtZeroThreshold = document["protectFatalDamageAtZeroThreshold"].GetBool();
+        }
+        if (document.HasMember("protectFatalDamageAtAnyThreshold") && document["protectFatalDamageAtAnyThreshold"].IsBool()) {
+            config.protectFatalDamageAtAnyThreshold = document["protectFatalDamageAtAnyThreshold"].GetBool();
+        }
+        if (document.HasMember("preventFatalKillmoves") && document["preventFatalKillmoves"].IsBool()) {
+            config.preventFatalKillmoves = document["preventFatalKillmoves"].GetBool();
         }
         ReadForm(document, "fatalProtectionPerk", config.fatalProtectionPerk);
         if (document.HasMember("castEmergencyMagicIfNoItems") && document["castEmergencyMagicIfNoItems"].IsBool()) {
@@ -534,6 +699,17 @@ namespace EmergencyHealMenu
             config.castEvenWithoutMana = document["castEvenWithoutMana"].GetBool();
         }
         ReadForm(document, "noManaCastPerk", config.noManaCastPerk);
+        if (document.HasMember("godMercyEnabled") && document["godMercyEnabled"].IsBool()) {
+            config.godMercyEnabled = document["godMercyEnabled"].GetBool();
+        }
+        ReadForm(document, "godMercyPerk", config.godMercyPerk);
+        if (document.HasMember("godMercyHealAmount")) {
+            DeserializeSourcedValue(document["godMercyHealAmount"], config.godMercyHealAmount);
+        }
+        if (document.HasMember("godMercyHealMode") && document["godMercyHealMode"].IsInt()) {
+            config.godMercyHealMode = static_cast<EmergencyHeal::Settings::ThresholdMode>(
+                std::clamp(document["godMercyHealMode"].GetInt(), 0, 1));
+        }
 
         if (document.HasMember("additionalSpells") && document["additionalSpells"].IsArray()) {
             config.additionalSpells.clear();
@@ -551,6 +727,19 @@ namespace EmergencyHealMenu
         config.healthThreshold.fixedValue = std::max(0.0F, config.healthThreshold.fixedValue);
         config.usagePeriodDays.fixedValue = std::clamp(config.usagePeriodDays.fixedValue, 1.0F, 365.0F);
         config.activationsPerDay.fixedValue = std::clamp(config.activationsPerDay.fixedValue, 0.0F, 1000.0F);
+        config.potionActivationsPerDay.fixedValue =
+            std::clamp(config.potionActivationsPerDay.fixedValue, 0.0F, 1000.0F);
+        config.magicActivationsPerDay.fixedValue =
+            std::clamp(config.magicActivationsPerDay.fixedValue, 0.0F, 1000.0F);
+        config.godMercyActivationsPerDay.fixedValue =
+            std::clamp(config.godMercyActivationsPerDay.fixedValue, 0.0F, 1000.0F);
+        config.potionCooldown.duration.fixedValue =
+            std::max(0.0F, config.potionCooldown.duration.fixedValue);
+        config.magicCooldown.duration.fixedValue =
+            std::max(0.0F, config.magicCooldown.duration.fixedValue);
+        config.godMercyCooldown.duration.fixedValue =
+            std::max(0.0F, config.godMercyCooldown.duration.fixedValue);
+        config.godMercyHealAmount.fixedValue = std::max(0.0F, config.godMercyHealAmount.fixedValue);
     }
 
     void SaveSettings()
@@ -566,14 +755,29 @@ namespace EmergencyHealMenu
         document.AddMember("thresholdMode", static_cast<int>(config.thresholdMode), alloc);
         document.AddMember("usagePeriodDays", SerializeSourcedValue(config.usagePeriodDays, alloc), alloc);
         document.AddMember("activationsPerDay", SerializeSourcedValue(config.activationsPerDay, alloc), alloc);
+        document.AddMember("potionActivationsPerDay",
+            SerializeSourcedValue(config.potionActivationsPerDay, alloc), alloc);
+        document.AddMember("magicActivationsPerDay",
+            SerializeSourcedValue(config.magicActivationsPerDay, alloc), alloc);
+        document.AddMember("godMercyActivationsPerDay",
+            SerializeSourcedValue(config.godMercyActivationsPerDay, alloc), alloc);
+        document.AddMember("potionCooldown", SerializeCooldown(config.potionCooldown, alloc), alloc);
+        document.AddMember("magicCooldown", SerializeCooldown(config.magicCooldown, alloc), alloc);
+        document.AddMember("godMercyCooldown", SerializeCooldown(config.godMercyCooldown, alloc), alloc);
         WriteForm(document, alloc, "requiredPerk", config.requiredPerk);
         WriteForm(document, alloc, "disablingPerk", config.disablingPerk);
         document.AddMember("protectFatalDamageAtZeroThreshold", config.protectFatalDamageAtZeroThreshold, alloc);
+        document.AddMember("protectFatalDamageAtAnyThreshold", config.protectFatalDamageAtAnyThreshold, alloc);
+        document.AddMember("preventFatalKillmoves", config.preventFatalKillmoves, alloc);
         WriteForm(document, alloc, "fatalProtectionPerk", config.fatalProtectionPerk);
         document.AddMember("castEmergencyMagicIfNoItems", config.castEmergencyMagicIfNoItems, alloc);
         WriteForm(document, alloc, "emergencyMagicPerk", config.emergencyMagicPerk);
         document.AddMember("castEvenWithoutMana", config.castEvenWithoutMana, alloc);
         WriteForm(document, alloc, "noManaCastPerk", config.noManaCastPerk);
+        document.AddMember("godMercyEnabled", config.godMercyEnabled, alloc);
+        WriteForm(document, alloc, "godMercyPerk", config.godMercyPerk);
+        document.AddMember("godMercyHealAmount", SerializeSourcedValue(config.godMercyHealAmount, alloc), alloc);
+        document.AddMember("godMercyHealMode", static_cast<int>(config.godMercyHealMode), alloc);
 
         rapidjson::Value spells(rapidjson::kArrayType);
         for (const auto& entry : config.additionalSpells) {
@@ -606,8 +810,8 @@ namespace EmergencyHealMenu
         registered = true;
         LoadLanguage();
         LoadSettings();
-        SKSEMenuFramework::SetSection(GetLoc("menu.section", "Emergency Heal"));
-        SKSEMenuFramework::AddSectionItem(GetLoc("menu.gameplay", "Emergency Heal settings"), GameplayRender);
+        SKSEMenuFramework::SetSection(GetLoc("menu.section", "Emergency Healing"));
+        SKSEMenuFramework::AddSectionItem(GetLoc("menu.gameplay", "Emergency Healing settings"), GameplayRender);
         SKSEMenuFramework::AddSectionItem(GetLoc("menu.effects", "Add buffs or debuffs"), AdditionalSpellsRender);
     }
 }

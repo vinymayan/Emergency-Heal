@@ -23,14 +23,12 @@ void OnMessage(SKSE::MessagingInterface::Message* message) {
             Manager::GetSingleton()->PopulateAllLists();
         }
     }
-    if (message->type == SKSE::MessagingInterface::kNewGame || message->type == SKSE::MessagingInterface::kPostLoadGame) {
-    }
 }
 
 SKSEPluginLoad(const SKSE::LoadInterface *skse) {
 
     SetupLog();
-    logger::info("Plugin loaded");
+    logger::info("Plugin loaded.");
     SKSE::Init(skse);
     if (auto* serialization = SKSE::GetSerializationInterface()) {
         serialization->SetUniqueID(EmergencyHeal::Serialization::kSerializationID);
